@@ -2,10 +2,15 @@
 package repository
 
 import (
+	"bufio"
 	"collision_app_go/internal/model"
 	"collision_app_go/utils"
 	"context"
 	"fmt"
+	"hash/fnv"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -64,19 +69,151 @@ func (r *BuildingRepository) GetCollisionBuildingsInfo(ctx context.Context, long
 // Placeholder for insert logic - you need to implement file reading/parsing
 func (r *BuildingRepository) InsertBuildingsFromFile(ctx context.Context, filePath string) (map[string]interface{}, error) {
 	utils.Infof("Inserting buildings from file: %s", filePath)
-	// TODO: Implement actual file reading and database insertion logic
-	// Example:
-	// 1. Open file at filePath
-	// 2. Parse data (CSV?)
-	// 3. Prepare INSERT statements or use pgx.CopyFrom
-	// 4. Execute inserts
-	// 5. Handle errors
-	// For now, simulate success
+
+	// Open the file
+	file, err := os.Open(filePath)
+	if err != nil {
+		utils.Errorf("Failed to open file: %v", err)
+		return map[string]interface{}{
+			"success":  false,
+			"code":     500,
+			"errorMsg": "File not found",
+		}, nil
+	}
+	defer file.Close()
+
+	// Read all lines
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		utils.Errorf("Error reading file: %v", err)
+		return map[string]interface{}{
+			"success":  false,
+			"code":     500,
+			"errorMsg": fmt.Sprintf("Error reading file: %v", err),
+		}, nil
+	}
+
+	utils.Infof("Read %d lines from file", len(lines))
+
+	successCount := 0
+	errorCount := 0
+
+	// Process each line individually
+	for lineNum, line := range lines {
+		originalLineNum := lineNum + 1
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Process single record
+		success, err := r.processSingleRecord(ctx, line, originalLineNum)
+		if err != nil {
+			utils.Infof("Line %d: Processing failed - %v", originalLineNum, err)
+			errorCount++
+			continue
+		}
+
+		if success {
+			successCount++
+			utils.Infof("✓ Line %d: Insert successful", originalLineNum)
+		} else {
+			errorCount++
+			utils.Infof("✗ Line %d: Insert failed", originalLineNum)
+		}
+	}
+
+	// Calculate success rate
+	successRate := 0.0
+	if len(lines) > 0 {
+		successRate = float64(successCount) / float64(len(lines)) * 100
+	}
+
+	utils.Infof("File data insertion completed!")
+	utils.Infof("Successfully inserted: %d", successCount)
+	utils.Infof("Failed to process: %d", errorCount)
+	utils.Infof("Overall success rate: %.1f%%", successRate)
+
 	return map[string]interface{}{
 		"success": true,
 		"code":    200,
-		"message": fmt.Sprintf("Buildings inserted from %s (placeholder)", filePath),
+		"data": map[string]interface{}{
+			"success_count": successCount,
+			"error_count":   errorCount,
+			"total_count":   len(lines),
+			"success_rate":  successRate,
+		},
 	}, nil
+}
+
+func (r *BuildingRepository) processSingleRecord(ctx context.Context, line string, lineNum int) (bool, error) {
+	// Parse the line (format: MULTIPOLYGON(((...))),13.56)
+	parts := strings.Split(line, ",")
+	if len(parts) < 2 {
+		return false, fmt.Errorf("invalid format")
+	}
+
+	// Get WKT and height parts
+	wktPart := strings.Join(parts[:len(parts)-1], ",")
+	heightStr := parts[len(parts)-1]
+
+	// Clean WKT and height strings
+	wktGeom := strings.Trim(strings.TrimSpace(wktPart), `"'`)
+	heightStr = strings.Trim(strings.TrimSpace(heightStr), `"'`)
+
+	// Validate WKT format
+	if !strings.HasPrefix(strings.ToUpper(wktGeom), "MULTIPOLYGON") || !strings.HasSuffix(wktGeom, "))") {
+		return false, fmt.Errorf("invalid WKT format")
+	}
+
+	// Parse height
+	buildingHeight, err := strconv.ParseFloat(heightStr, 64)
+	if err != nil {
+		return false, fmt.Errorf("invalid height format: %v", err)
+	}
+
+	// Generate building ID
+	buildingID, err := GenerateBuildingIDPureCode(wktGeom)
+	if err != nil {
+		return false, fmt.Errorf("failed to generate building ID: %v", err)
+	}
+
+	// Execute single insert with individual transaction
+	insertQuery := `
+		INSERT INTO hzdk_buildings (geom, building_height, building_id)
+		VALUES (ST_GeomFromText($1, 4326), $2, $3)
+	`
+
+	_, err = r.dbpool.Exec(ctx, insertQuery, wktGeom, buildingHeight, buildingID)
+	if err != nil {
+		return false, fmt.Errorf("database insert failed: %v", err)
+	}
+
+	return true, nil
+}
+
+func GenerateBuildingIDPureCode(wktGeom string) (int64, error) {
+	// 使用哈希算法生成纯数字ID
+	hash := fnv.New64a()
+	hash.Write([]byte(wktGeom))
+	id := int64(hash.Sum64())
+
+	// 确保ID为正数
+	if id < 0 {
+		id = -id
+	}
+
+	// 如果ID为0，设置默认值
+	if id == 0 {
+		id = 1
+	}
+
+	return id, nil
 }
 
 // Placeholder for update logic
